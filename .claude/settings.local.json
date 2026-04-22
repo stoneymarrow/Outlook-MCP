@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv add:*)",
+      "Bash(uv run:*)",
+      "Bash(AZURE_TENANT_ID=test AZURE_CLIENT_ID=test AZURE_CLIENT_SECRET=test OUTLOOK_USER_EMAIL=test@test.com uv run python -c \"from main import mcp_server; print\\(f'Server: {mcp_server.name}'\\); tools = [t for t in mcp_server._tool_manager._tools.keys\\(\\)]; print\\(f'Tools \\({len\\(tools\\)}\\): {tools}'\\)\")",
+      "Bash(AZURE_TENANT_ID=test AZURE_CLIENT_ID=test AZURE_CLIENT_SECRET=test OUTLOOK_USER_EMAIL=test@test.com uv run python -c \"from main import mcp; print\\(f'Server: {mcp.name}'\\); tools = list\\(mcp._tool_manager._tools.keys\\(\\)\\); print\\(f'Tools \\({len\\(tools\\)}\\): {tools}'\\)\")",
+      "Bash(AZURE_TENANT_ID=test AZURE_CLIENT_ID=test AZURE_CLIENT_SECRET=test OUTLOOK_USER_EMAIL=test@test.com uv run python -c \"from main import mcp; tools = list\\(mcp._tool_manager._tools.keys\\(\\)\\); print\\(f'Tools \\({len\\(tools\\)}\\): {tools}'\\)\")",
+      "Bash(uv remove:*)",
+      "Bash(gh auth:*)",
+      "Bash(gh repo:*)",
+      "WebSearch"
+    ]
+  }
+}

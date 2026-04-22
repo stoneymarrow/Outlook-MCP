@@ -1,0 +1,778 @@
+"""Outlook MCP Server — client credentials flow, no token expiry."""
+
+import json
+import os
+from contextlib import asynccontextmanager
+
+import httpx
+import msal
+from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
+
+load_dotenv()
+
+TENANT_ID = os.environ["AZURE_TENANT_ID"]
+CLIENT_ID = os.environ["AZURE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
+USER_EMAIL = os.environ["OUTLOOK_USER_EMAIL"]
+
+GRAPH_BASE = f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}"
+GRAPH_TIMEOUT = 30.0
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+_msal_app: msal.ConfidentialClientApplication | None = None
+
+
+def _get_token() -> str:
+    global _msal_app
+    if _msal_app is None:
+        _msal_app = msal.ConfidentialClientApplication(
+            CLIENT_ID,
+            authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+            client_credential=CLIENT_SECRET,
+        )
+    result = _msal_app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+    if "access_token" in result:
+        return result["access_token"]
+    raise RuntimeError(f"Auth failed: {result.get('error_description', result)}")
+
+
+# ---------------------------------------------------------------------------
+# HTTP client lifecycle — single client reused across all tool calls
+# ---------------------------------------------------------------------------
+_http: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def _lifespan(server):
+    global _http
+    _http = httpx.AsyncClient(
+        base_url=GRAPH_BASE,
+        timeout=GRAPH_TIMEOUT,
+    )
+    try:
+        yield
+    finally:
+        await _http.aclose()
+        _http = None
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_get_token()}"}
+
+
+async def _graph_get(path: str, params: dict | None = None) -> dict:
+    r = await _http.get(path, headers=_auth_headers(), params=params)
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return r.json()
+
+
+async def _graph_post(path: str, body: dict) -> dict:
+    r = await _http.post(
+        path,
+        headers={**_auth_headers(), "Content-Type": "application/json"},
+        json=body,
+    )
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return r.json()
+
+
+def _raise_graph_error(r: httpx.Response):
+    try:
+        err = r.json().get("error", {})
+        msg = err.get("message", r.text)
+    except Exception:
+        msg = r.text
+    raise RuntimeError(f"Graph API {r.status_code}: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+_MSG_LIST_FIELDS = "id,internetMessageId,subject,from,receivedDateTime,isRead,hasAttachments"
+_MSG_FULL_FIELDS = f"{_MSG_LIST_FIELDS},body,toRecipients,ccRecipients"
+
+
+def _fmt_message(m: dict, full: bool = False) -> dict:
+    sender = m.get("from", {}).get("emailAddress", {}) or {}
+    out = {
+        "id": m["id"],
+        "internetMessageId": m.get("internetMessageId", ""),
+        "subject": m.get("subject", "(no subject)"),
+        "from": sender.get("address", "unknown"),
+        "fromName": sender.get("name", ""),
+        "received": m.get("receivedDateTime", ""),
+        "isRead": m.get("isRead", False),
+        "hasAttachments": m.get("hasAttachments", False),
+    }
+    if full:
+        body = m.get("body", {})
+        out["bodyType"] = body.get("contentType", "text")
+        out["body"] = body.get("content", "")
+        out["to"] = [r["emailAddress"]["address"] for r in m.get("toRecipients", [])]
+        out["cc"] = [r["emailAddress"]["address"] for r in m.get("ccRecipients", [])]
+    return out
+
+
+def _fmt_folder(f: dict) -> dict:
+    return {
+        "id": f["id"],
+        "name": f["displayName"],
+        "total": f.get("totalItemCount", 0),
+        "unread": f.get("unreadItemCount", 0),
+    }
+
+
+def _escape_odata(s: str) -> str:
+    """Escape single quotes for OData filter strings."""
+    return s.replace("'", "''")
+
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+mcp = FastMCP("outlook-mcp", lifespan=_lifespan)
+
+
+@mcp.tool()
+async def read_inbox(
+    top: int = 20,
+    sender: str | None = None,
+    subject: str | None = None,
+    since: str | None = None,
+) -> str:
+    """List recent inbox emails, newest first.
+
+    Args:
+        top: Number of emails to return (max 50).
+        sender: Filter by exact sender email address.
+        subject: Filter by subject (contains match).
+        since: Only emails after this date (YYYY-MM-DD).
+    """
+    top = min(top, 50)
+    filters = []
+    if sender:
+        filters.append(f"from/emailAddress/address eq '{_escape_odata(sender)}'")
+    if subject:
+        filters.append(f"contains(subject, '{_escape_odata(subject)}')")
+    if since:
+        filters.append(f"receivedDateTime ge {since}T00:00:00Z")
+
+    params: dict[str, str] = {
+        "$top": str(top),
+        "$orderby": "receivedDateTime desc",
+        "$select": _MSG_LIST_FIELDS,
+    }
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    data = await _graph_get("/mailFolders/inbox/messages", params)
+    return json.dumps([_fmt_message(m) for m in data.get("value", [])], indent=1)
+
+
+@mcp.tool()
+async def read_email(message_id: str) -> str:
+    """Get full content of a specific email by its ID."""
+    data = await _graph_get(
+        f"/messages/{message_id}",
+        params={"$select": _MSG_FULL_FIELDS},
+    )
+    return json.dumps(_fmt_message(data, full=True), indent=1)
+
+
+@mcp.tool()
+async def list_folder_messages(
+    folder_id: str,
+    top: int = 50,
+    since: str | None = None,
+) -> str:
+    """List messages in a specific mail folder, newest first.
+
+    Works for any folder (use list_folders to find IDs). Unlike read_inbox,
+    which is hardcoded to the Inbox folder.
+
+    Args:
+        folder_id: ID of the folder to list (from list_folders).
+        top: Number of messages to return (max 100).
+        since: Only messages after this date (YYYY-MM-DD).
+    """
+    top = min(top, 100)
+    params: dict[str, str] = {
+        "$top": str(top),
+        "$orderby": "receivedDateTime desc",
+        "$select": _MSG_LIST_FIELDS,
+    }
+    if since:
+        params["$filter"] = f"receivedDateTime ge {since}T00:00:00Z"
+
+    data = await _graph_get(f"/mailFolders/{folder_id}/messages", params)
+    return json.dumps([_fmt_message(m) for m in data.get("value", [])], indent=1)
+
+
+@mcp.tool()
+async def search_emails(query: str, top: int = 20) -> str:
+    """Search emails by keyword across subject, body, and sender.
+
+    Args:
+        query: Search keyword or phrase.
+        top: Max results (max 50).
+    """
+    top = min(top, 50)
+    data = await _graph_get("/messages", params={
+        "$search": f'"{query}"',
+        "$top": str(top),
+        "$select": _MSG_LIST_FIELDS,
+    })
+    return json.dumps([_fmt_message(m) for m in data.get("value", [])], indent=1)
+
+
+@mcp.tool()
+async def file_emails(moves: list[dict]) -> str:
+    """Move multiple emails to folders by folder name in a single call.
+
+    Resolves folder names to IDs automatically. Supports nested folders
+    with slash notation (e.g. "Clients/Acme"). Creates folders that
+    don't exist yet.
+
+    Args:
+        moves: List of {"email_id": "...", "folder": "FolderName"} dicts.
+               Use slash for nested folders: "Parent/Child".
+
+    Example:
+        file_emails(moves=[
+            {"email_id": "AAMk...", "folder": "Clients/Acme"},
+            {"email_id": "AAMk...", "folder": "Invoices"},
+            {"email_id": "AAMk...", "folder": "Newsletters"},
+        ])
+    """
+    # Build folder name→ID lookup (including children)
+    folder_data = await _graph_get("/mailFolders", params={"$top": "100"})
+    name_to_id: dict[str, str] = {}
+    parent_ids: dict[str, str] = {}  # name → id for top-level folders
+    for f in folder_data.get("value", []):
+        name = f["displayName"]
+        fid = f["id"]
+        name_to_id[name.lower()] = fid
+        parent_ids[name.lower()] = fid
+        if f.get("childFolderCount", 0) > 0:
+            children = await _graph_get(
+                f"/mailFolders/{fid}/childFolders",
+                params={"$top": "100"},
+            )
+            for c in children.get("value", []):
+                child_name = c["displayName"]
+                name_to_id[f"{name}/{child_name}".lower()] = c["id"]
+
+    results = []
+    for move in moves:
+        email_id = move["email_id"]
+        folder_path = move["folder"]
+        folder_key = folder_path.lower()
+
+        # Resolve or create the folder
+        if folder_key in name_to_id:
+            dest_id = name_to_id[folder_key]
+        else:
+            # Create the folder (handle nested paths)
+            parts = folder_path.split("/")
+            current_parent = None
+            for i, part in enumerate(parts):
+                partial_key = "/".join(parts[: i + 1]).lower()
+                if partial_key in name_to_id:
+                    current_parent = name_to_id[partial_key]
+                else:
+                    path = (
+                        f"/mailFolders/{current_parent}/childFolders"
+                        if current_parent
+                        else "/mailFolders"
+                    )
+                    created = await _graph_post(path, {"displayName": part})
+                    current_parent = created["id"]
+                    name_to_id[partial_key] = current_parent
+            dest_id = current_parent
+
+        # Move the email. Graph's /move returns the new message resource,
+        # which has a NEW folder-scoped id (the old id becomes stale) but
+        # the SAME stable internetMessageId across moves.
+        try:
+            data = await _graph_post(
+                f"/messages/{email_id}/move",
+                {"destinationId": dest_id},
+            )
+            results.append({
+                "email_id": email_id,
+                "new_id": data.get("id", ""),
+                "internet_message_id": data.get("internetMessageId", ""),
+                "folder": folder_path,
+                "status": "filed",
+            })
+        except RuntimeError as e:
+            results.append({"email_id": email_id, "folder": folder_path, "status": f"error: {e}"})
+
+    filed = sum(1 for r in results if r["status"] == "filed")
+    return json.dumps({"filed": filed, "total": len(results), "results": results}, indent=1)
+
+
+@mcp.tool()
+async def move_email(message_id: str, destination_folder_id: str) -> str:
+    """Move an email to a different folder.
+
+    Args:
+        message_id: ID of the email to move.
+        destination_folder_id: ID of the target folder (use list_folders to find IDs).
+    """
+    data = await _graph_post(
+        f"/messages/{message_id}/move",
+        {"destinationId": destination_folder_id},
+    )
+    return json.dumps({
+        "status": "moved",
+        "id": data["id"],
+        "to_folder": destination_folder_id,
+    })
+
+
+@mcp.tool()
+async def list_folders() -> str:
+    """List all mail folders and their child folders."""
+    data = await _graph_get("/mailFolders", params={"$top": "100"})
+    folders = []
+    for f in data.get("value", []):
+        folder = _fmt_folder(f)
+        if f.get("childFolderCount", 0) > 0:
+            children = await _graph_get(
+                f"/mailFolders/{f['id']}/childFolders",
+                params={"$top": "100"},
+            )
+            folder["children"] = [_fmt_folder(c) for c in children.get("value", [])]
+        folders.append(folder)
+    return json.dumps(folders, indent=1)
+
+
+@mcp.tool()
+async def create_folder(name: str, parent_folder_id: str | None = None) -> str:
+    """Create a new mail folder.
+
+    Args:
+        name: Name for the new folder.
+        parent_folder_id: Create as subfolder of this folder. Top-level if omitted.
+    """
+    path = (
+        f"/mailFolders/{parent_folder_id}/childFolders"
+        if parent_folder_id
+        else "/mailFolders"
+    )
+    data = await _graph_post(path, {"displayName": name})
+    return json.dumps(_fmt_folder(data), indent=1)
+
+
+@mcp.tool()
+async def delete_folder(folder_id: str, force: bool = False) -> str:
+    """Delete a mail folder.
+
+    By default, refuses to delete folders that contain messages or child
+    folders — move them out first with move_email/file_emails. Pass
+    force=True to delete anyway (contents go to Deleted Items).
+
+    Args:
+        folder_id: ID of the folder to delete (use list_folders to find IDs).
+        force: If True, delete even if the folder is non-empty.
+    """
+    if not force:
+        info = await _graph_get(
+            f"/mailFolders/{folder_id}",
+            params={"$select": "displayName,totalItemCount,childFolderCount"},
+        )
+        total = info.get("totalItemCount", 0)
+        children = info.get("childFolderCount", 0)
+        if total > 0 or children > 0:
+            return json.dumps({
+                "status": "refused",
+                "reason": "folder not empty",
+                "name": info.get("displayName", ""),
+                "totalItemCount": total,
+                "childFolderCount": children,
+                "hint": "move messages out first, or pass force=True",
+            }, indent=1)
+
+    r = await _http.delete(
+        f"/mailFolders/{folder_id}",
+        headers=_auth_headers(),
+    )
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return json.dumps({"status": "deleted", "id": folder_id})
+
+
+@mcp.tool()
+async def send_email(
+    to: list[str],
+    subject: str,
+    body: str,
+    cc: list[str] | None = None,
+    body_type: str = "Text",
+) -> str:
+    """Send an email.
+
+    Args:
+        to: List of recipient email addresses.
+        subject: Email subject line.
+        body: Email body content.
+        cc: Optional list of CC email addresses.
+        body_type: "Text" for plain text or "HTML" for rich content.
+    """
+    message: dict = {
+        "subject": subject,
+        "body": {"contentType": body_type, "content": body},
+        "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+    }
+    if cc:
+        message["ccRecipients"] = [{"emailAddress": {"address": a}} for a in cc]
+
+    r = await _http.post(
+        "/sendMail",
+        headers={**_auth_headers(), "Content-Type": "application/json"},
+        json={"message": message},
+    )
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return json.dumps({"status": "sent", "to": to, "subject": subject})
+
+
+@mcp.tool()
+async def suggest_folders(top: int = 50) -> str:
+    """Return recent inbox emails grouped by sender domain for folder planning.
+
+    Returns sender domains ranked by email count with sample subjects and
+    email IDs. Use this data to decide folder structure, then call
+    create_folder and move_email to execute.
+
+    Args:
+        top: Number of recent inbox emails to analyze (max 200).
+    """
+    top = min(top, 200)
+    data = await _graph_get("/mailFolders/inbox/messages", params={
+        "$top": str(top),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,receivedDateTime",
+    })
+
+    groups: dict[str, list[dict]] = {}
+    for m in data.get("value", []):
+        addr = m.get("from", {}).get("emailAddress", {}).get("address", "unknown")
+        domain = addr.rsplit("@", 1)[-1] if "@" in addr else "unknown"
+        groups.setdefault(domain, []).append({
+            "id": m["id"],
+            "subject": m.get("subject", ""),
+            "from": addr,
+            "received": m.get("receivedDateTime", ""),
+        })
+
+    ranked = [
+        {
+            "domain": domain,
+            "count": len(msgs),
+            "sample_subjects": [m["subject"] for m in msgs[:5]],
+            "email_ids": [m["id"] for m in msgs],
+        }
+        for domain, msgs in sorted(groups.items(), key=lambda x: -len(x[1]))
+    ]
+
+    return json.dumps({"analyzed": len(data.get("value", [])), "by_domain": ranked}, indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Reply / Forward
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def reply_email(
+    message_id: str,
+    body: str,
+    reply_all: bool = False,
+    body_type: str = "Text",
+) -> str:
+    """Reply to an email thread.
+
+    Args:
+        message_id: ID of the email to reply to.
+        body: Reply body content.
+        reply_all: True to reply to all recipients, False for sender only.
+        body_type: "Text" or "HTML".
+    """
+    action = "replyAll" if reply_all else "reply"
+    r = await _http.post(
+        f"/messages/{message_id}/{action}",
+        headers={**_auth_headers(), "Content-Type": "application/json"},
+        json={"comment": body},
+    )
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return json.dumps({"status": "replied", "id": message_id, "replyAll": reply_all})
+
+
+@mcp.tool()
+async def forward_email(
+    message_id: str,
+    to: list[str],
+    body: str | None = None,
+    body_type: str = "Text",
+) -> str:
+    """Forward an email to new recipients.
+
+    Args:
+        message_id: ID of the email to forward.
+        to: List of recipient email addresses.
+        body: Optional comment to include above the forwarded message.
+        body_type: "Text" or "HTML".
+    """
+    payload: dict = {
+        "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+    }
+    if body:
+        payload["comment"] = body
+    r = await _http.post(
+        f"/messages/{message_id}/forward",
+        headers={**_auth_headers(), "Content-Type": "application/json"},
+        json=payload,
+    )
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return json.dumps({"status": "forwarded", "id": message_id, "to": to})
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+_ATTACH_LIST_FIELDS = "id,name,contentType,size"
+
+
+def _fmt_attachment(a: dict, full: bool = False) -> dict:
+    out = {
+        "id": a["id"],
+        "name": a.get("name", "unnamed"),
+        "contentType": a.get("contentType", ""),
+        "size": a.get("size", 0),
+    }
+    if full:
+        out["contentBytes"] = a.get("contentBytes", "")
+    return out
+
+
+@mcp.tool()
+async def list_attachments(message_id: str) -> str:
+    """List attachments on an email.
+
+    Args:
+        message_id: ID of the email.
+    """
+    data = await _graph_get(
+        f"/messages/{message_id}/attachments",
+        params={"$select": _ATTACH_LIST_FIELDS},
+    )
+    return json.dumps([_fmt_attachment(a) for a in data.get("value", [])], indent=1)
+
+
+@mcp.tool()
+async def get_attachment(message_id: str, attachment_id: str) -> str:
+    """Download an attachment's content (base64-encoded).
+
+    Args:
+        message_id: ID of the email.
+        attachment_id: ID of the attachment (use list_attachments to find IDs).
+    """
+    data = await _graph_get(f"/messages/{message_id}/attachments/{attachment_id}")
+    return json.dumps(_fmt_attachment(data, full=True), indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Contacts
+# ---------------------------------------------------------------------------
+_CONTACT_FIELDS = "id,displayName,emailAddresses,companyName,jobTitle,mobilePhone,businessPhones"
+
+
+def _fmt_contact(c: dict) -> dict:
+    emails = c.get("emailAddresses", [])
+    return {
+        "id": c["id"],
+        "name": c.get("displayName", ""),
+        "emails": [e.get("address", "") for e in emails],
+        "company": c.get("companyName", ""),
+        "jobTitle": c.get("jobTitle", ""),
+        "mobile": c.get("mobilePhone", ""),
+        "phones": c.get("businessPhones", []),
+    }
+
+
+@mcp.tool()
+async def list_contacts(top: int = 50) -> str:
+    """List Outlook contacts.
+
+    Args:
+        top: Max contacts to return (max 100).
+    """
+    top = min(top, 100)
+    data = await _graph_get("/contacts", params={
+        "$top": str(top),
+        "$orderby": "displayName",
+        "$select": _CONTACT_FIELDS,
+    })
+    return json.dumps([_fmt_contact(c) for c in data.get("value", [])], indent=1)
+
+
+@mcp.tool()
+async def search_contacts(query: str, top: int = 20) -> str:
+    """Search contacts by name or email.
+
+    Args:
+        query: Search keyword (matches name, email, company).
+        top: Max results (max 50).
+    """
+    top = min(top, 50)
+    data = await _graph_get("/contacts", params={
+        "$search": f'"{query}"',
+        "$top": str(top),
+        "$select": _CONTACT_FIELDS,
+    })
+    return json.dumps([_fmt_contact(c) for c in data.get("value", [])], indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Calendar helpers
+# ---------------------------------------------------------------------------
+_EVENT_LIST_FIELDS = "id,subject,start,end,location,organizer,attendees,isOnlineMeeting,webLink"
+_EVENT_FULL_FIELDS = f"{_EVENT_LIST_FIELDS},body,onlineMeeting"
+
+
+def _fmt_event(e: dict, full: bool = False) -> dict:
+    out = {
+        "id": e["id"],
+        "subject": e.get("subject", "(no subject)"),
+        "start": e.get("start", {}).get("dateTime", ""),
+        "end": e.get("end", {}).get("dateTime", ""),
+        "timeZone": e.get("start", {}).get("timeZone", ""),
+        "location": e.get("location", {}).get("displayName", ""),
+        "organizer": e.get("organizer", {}).get("emailAddress", {}).get("address", ""),
+        "isOnlineMeeting": e.get("isOnlineMeeting", False),
+        "attendees": [
+            {
+                "email": a["emailAddress"]["address"],
+                "type": a.get("type", "required"),
+                "response": a.get("status", {}).get("response", "none"),
+            }
+            for a in e.get("attendees", [])
+        ],
+    }
+    if full:
+        body = e.get("body", {})
+        out["bodyType"] = body.get("contentType", "text")
+        out["body"] = body.get("content", "")
+        meeting = e.get("onlineMeeting") or {}
+        out["joinUrl"] = meeting.get("joinUrl", "")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Calendar tools
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def list_events(
+    start: str,
+    end: str,
+    top: int = 25,
+) -> str:
+    """List calendar events in a date range.
+
+    Args:
+        start: Start date/time in ISO 8601 (e.g. 2026-04-01T00:00:00).
+        end: End date/time in ISO 8601 (e.g. 2026-04-07T23:59:59).
+        top: Max events to return (max 50).
+    """
+    top = min(top, 50)
+    data = await _graph_get("/calendarView", params={
+        "startDateTime": start,
+        "endDateTime": end,
+        "$top": str(top),
+        "$orderby": "start/dateTime",
+        "$select": _EVENT_LIST_FIELDS,
+    })
+    return json.dumps([_fmt_event(e) for e in data.get("value", [])], indent=1)
+
+
+@mcp.tool()
+async def get_event(event_id: str) -> str:
+    """Get full details of a calendar event by ID."""
+    data = await _graph_get(
+        f"/events/{event_id}",
+        params={"$select": _EVENT_FULL_FIELDS},
+    )
+    return json.dumps(_fmt_event(data, full=True), indent=1)
+
+
+@mcp.tool()
+async def create_event(
+    subject: str,
+    start: str,
+    end: str,
+    attendees: list[str] | None = None,
+    location: str | None = None,
+    body: str | None = None,
+    body_type: str = "Text",
+    is_online_meeting: bool = False,
+    time_zone: str = "India Standard Time",
+) -> str:
+    """Create a calendar event or meeting.
+
+    Args:
+        subject: Event title.
+        start: Start date/time (e.g. 2026-04-05T10:00:00).
+        end: End date/time (e.g. 2026-04-05T11:00:00).
+        attendees: List of attendee email addresses. Sends invite automatically.
+        location: Location name (e.g. "Conference Room A").
+        body: Event description/agenda.
+        body_type: "Text" or "HTML".
+        is_online_meeting: Set true to generate a Teams meeting link.
+        time_zone: IANA or Windows time zone (default: India Standard Time).
+    """
+    event: dict = {
+        "subject": subject,
+        "start": {"dateTime": start, "timeZone": time_zone},
+        "end": {"dateTime": end, "timeZone": time_zone},
+        "isOnlineMeeting": is_online_meeting,
+    }
+    if attendees:
+        event["attendees"] = [
+            {"emailAddress": {"address": a}, "type": "required"} for a in attendees
+        ]
+    if location:
+        event["location"] = {"displayName": location}
+    if body:
+        event["body"] = {"contentType": body_type, "content": body}
+
+    data = await _graph_post("/events", event)
+    return json.dumps(_fmt_event(data), indent=1)
+
+
+@mcp.tool()
+async def delete_event(event_id: str) -> str:
+    """Delete/cancel a calendar event by ID.
+
+    Args:
+        event_id: ID of the event to delete (use list_events to find IDs).
+    """
+    r = await _http.delete(
+        f"/events/{event_id}",
+        headers=_auth_headers(),
+    )
+    if r.status_code >= 400:
+        _raise_graph_error(r)
+    return json.dumps({"status": "deleted", "id": event_id})
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
