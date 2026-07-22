@@ -340,24 +340,35 @@ class AttachmentDownloadTests(unittest.IsolatedAsyncioTestCase):
                     )
             self.assertEqual(list(destination.iterdir()), [])
 
-    async def test_declared_size_mismatch_removes_partial_file(self) -> None:
+    async def test_mime_vs_decoded_size_delta_is_not_treated_as_corruption(
+        self,
+    ) -> None:
+        """Graph's declared MIME size legitimately exceeds the decoded bytes.
+
+        The delivered bytes (an unrecognized format) carry no structural claim,
+        so they must be accepted verbatim even though the declared size differs.
+        Delivered-vs-declared byte counts must never be compared for equality.
+        """
+        content = b"decoded octet payload"
         handler = attachment_handler(
-            attachment_id="truncated-file",
-            name="synthetic-truncated.bin",
-            content=b"four",
-            declared_size=5,
+            attachment_id="mime-delta-file",
+            name="synthetic-decoded.bin",
+            content=content,
+            declared_size=len(content) + 128,
         )
 
         with tempfile.TemporaryDirectory() as temporary_root:
             destination = Path(temporary_root) / "downloads"
             async with synthetic_graph(handler):
-                with self.assertRaises(main.AttachmentSizeMismatchError):
+                response = json.loads(
                     await main.download_attachment(
-                        "message-truncated",
-                        "truncated-file",
+                        "message-mime-delta",
+                        "mime-delta-file",
                         str(destination),
                     )
-            self.assertEqual(list(destination.iterdir()), [])
+                )
+            self.assertEqual(Path(response["path"]).read_bytes(), content)
+            self.assertEqual(response["size"], len(content))
 
 
 class ReadOnlyScopeTests(unittest.TestCase):
