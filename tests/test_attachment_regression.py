@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -32,6 +33,25 @@ class AttachmentTransportRegressionTest(unittest.IsolatedAsyncioTestCase):
         expected_sha256 = hashlib.sha256(attachment_bytes).hexdigest()
 
         async def graph_fixture(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/message-binary/attachments"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {
+                                "@odata.type": "#microsoft.graph.fileAttachment",
+                                "id": "attachment-binary",
+                                "name": "synthetic-register.xlsx",
+                                "contentType": (
+                                    "application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.sheet"
+                                ),
+                                "size": len(attachment_bytes),
+                                "isInline": False,
+                            }
+                        ]
+                    },
+                )
             if request.url.path.endswith("/attachments/attachment-binary"):
                 return httpx.Response(
                     200,
@@ -57,36 +77,58 @@ class AttachmentTransportRegressionTest(unittest.IsolatedAsyncioTestCase):
             transport=httpx.MockTransport(graph_fixture),
         )
         with tempfile.TemporaryDirectory() as destination:
-            async with create_connected_server_and_client_session(
-                main.mcp,
-                read_timeout_seconds=timedelta(seconds=5),
-            ) as session:
-                lifespan_http = main._http
-                main._http = fixture_http
-                try:
-                    result = await session.call_tool(
-                        "download_attachment",
-                        {
-                            "message_id": "message-binary",
-                            "attachment_id": "attachment-binary",
-                            "destination_directory": destination,
-                        },
-                    )
-                finally:
-                    main._http = lifespan_http
+            with patch.object(
+                main,
+                "_auth_headers",
+                return_value={"Authorization": "Bearer synthetic-token"},
+            ):
+                async with create_connected_server_and_client_session(
+                    main.mcp,
+                    read_timeout_seconds=timedelta(seconds=5),
+                ) as session:
+                    lifespan_http = main._http
+                    main._http = fixture_http
+                    try:
+                        listing_result = await session.call_tool(
+                            "list_attachments",
+                            {"message_id": "message-binary"},
+                        )
+                        result = await session.call_tool(
+                            "download_attachment",
+                            {
+                                "message_id": "message-binary",
+                                "attachment_id": "attachment-binary",
+                                "destination_directory": destination,
+                            },
+                        )
+                    finally:
+                        main._http = lifespan_http
 
             await fixture_http.aclose()
 
             response_text = "".join(
                 block.text for block in result.content if hasattr(block, "text")
             )
+            listing_text = "".join(
+                block.text for block in listing_result.content if hasattr(block, "text")
+            )
+            self.assertFalse(listing_result.isError, listing_text)
             self.assertFalse(result.isError, response_text)
+            listing = json.loads(listing_text)
             response = json.loads(response_text)
             delivered_path = Path(response["path"])
 
+            self.assertEqual(listing[0]["kind"], "fileAttachment")
             self.assertEqual(delivered_path.read_bytes(), attachment_bytes)
+            self.assertEqual(response["originalFilename"], "synthetic-register.xlsx")
+            self.assertEqual(response["filename"], "synthetic-register.xlsx")
+            self.assertEqual(
+                response["contentType"],
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
             self.assertEqual(response["sha256"], expected_sha256)
             self.assertEqual(response["size"], len(attachment_bytes))
+            self.assertEqual(response["kind"], "fileAttachment")
             self.assertNotIn("contentBytes", response)
 
 

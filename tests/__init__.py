@@ -1,0 +1,1 @@
+"""Outlook MCP test suite."""
