@@ -8,6 +8,7 @@ MCP server for Microsoft 365 email + calendar + contacts. Uses Graph API with cl
 - Single httpx.AsyncClient with 30s timeout, reused across all tool calls
 - Attachment bytes stream from Graph's raw endpoint to a temporary local file; only delivery metadata crosses MCP
 - Credentials in `.env` (gitignored), registered in `~/.claude/.mcp.json` and Claude Desktop
+- Shutdown: `main._run_stdio` exits via `os._exit` after transport + lifespan cleanup (not a plain `mcp.run`). This skips interpreter finalization, which otherwise races the anyio stdio worker thread and self-aborts (`_enter_buffered_busy` SIGABRT). Do not revert it; regression-guarded in `tests/test_shutdown_regression.py`
 
 ## Azure AD App
 - Application registration in your tenant

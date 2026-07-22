@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import stat
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1173,5 +1175,46 @@ async def delete_event(event_id: str) -> str:
     return json.dumps({"status": "deleted", "id": event_id})
 
 
+def _run_stdio() -> None:
+    """Serve over stdio, then exit without interpreter finalization.
+
+    Every disconnect path - stdin EOF (the normal client-disconnect), SIGINT,
+    and SIGTERM - unwinds the stdio transport and the httpx-closing lifespan
+    (`_lifespan`) cleanly inside ``mcp.run``. Only once that cleanup has
+    completed do we skip interpreter finalization with ``os._exit``.
+
+    Why skip finalization: the anyio stdio transport drives stdin/stdout
+    through a worker thread that can still be blocked mid-``readline`` (holding
+    the buffered-stream lock) at exit time. If CPython finalizes, it deallocates
+    the stdin/stdout ``TextIOWrapper`` and ``_enter_buffered_busy`` fails to
+    acquire that lock, raising a fatal error and ``abort()`` (SIGABRT). That
+    self-abort produced a near-daily macOS crash report. ``os._exit(0)`` after
+    clean shutdown sidesteps the race entirely. This remedy is derived locally
+    from the diagnosed mechanism: there is no upstream python-sdk issue tracking
+    this abort as of mcp 1.26.0 (issue #575 is an unrelated Windows cleanup bug;
+    #1933 is a different, ValueError-on-closed-stdio symptom).
+    """
+
+    def _terminate(signum: int, frame: object) -> None:
+        # Re-raise SIGTERM as KeyboardInterrupt so anyio unwinds the transport
+        # and runs the lifespan httpx cleanup exactly as it does for Ctrl+C.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _terminate)
+
+    try:
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        # SIGINT/SIGTERM: cleanup already ran during the anyio unwind.
+        pass
+    except BaseException:
+        # A genuine failure must not be masked by the clean-exit path. Surface
+        # it, then exit nonzero - still without finalization, which could also
+        # race the I/O worker.
+        traceback.print_exc()
+        os._exit(1)
+    os._exit(0)
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    _run_stdio()
