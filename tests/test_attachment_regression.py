@@ -2,10 +2,12 @@
 
 import base64
 import hashlib
+import io
 import json
 import os
 import tempfile
 import unittest
+import zipfile
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -24,12 +26,14 @@ import main
 class AttachmentTransportRegressionTest(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_binary_runs_remain_byte_identical(self) -> None:
         """Binary bytes must never cross the MCP response as base64 text."""
-        attachment_bytes = (
-            b"PK\x03\x04"
-            + (b"\x00" * (256 * 1024))
-            + bytes(range(256))
-            + b"synthetic fixture only"
-        )
+        # A real ZIP container (like the xlsx it mimics): high-byte binary body
+        # plus a valid end-of-central-directory record, so it survives both the
+        # base64-transport check and the structural integrity gate.
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as archive:
+            archive.writestr("sheet1.bin", bytes(range(256)) * 1024)
+            archive.writestr("notes.txt", b"synthetic fixture only")
+        attachment_bytes = zip_buffer.getvalue()
         expected_sha256 = hashlib.sha256(attachment_bytes).hexdigest()
 
         async def graph_fixture(request: httpx.Request) -> httpx.Response:

@@ -7,6 +7,7 @@ MCP server for Microsoft 365 email + calendar + contacts. Uses Graph API with cl
 - Client credentials flow (application permissions) via MSAL - auth never expires
 - Single httpx.AsyncClient with 30s timeout, reused across all tool calls
 - Attachment bytes stream from Graph's raw endpoint to a temporary local file; only delivery metadata crosses MCP
+- Attachment integrity is validated on the delivered decoded bytes (sha256 + magic-number structural checks for truncation), never by comparing to Graph's `size` field, which reports MIME/base64-encoded size and legitimately differs. A delivered file that fails validation is preserved on disk, never deleted. See `_verify_delivered_integrity` in `main.py`; regression-guarded in `tests/test_attachment_size_validation.py`
 - Credentials in `.env` (gitignored), registered in `~/.claude/.mcp.json` and Claude Desktop
 - Shutdown: `main._run_stdio` exits via `os._exit` after transport + lifespan cleanup (not a plain `mcp.run`). This skips interpreter finalization, which otherwise races the anyio stdio worker thread and self-aborts (`_enter_buffered_busy` SIGABRT). Do not revert it; regression-guarded in `tests/test_shutdown_regression.py`
 

@@ -651,9 +651,84 @@ class AttachmentTooLargeError(AttachmentDeliveryError):
 
 
 class AttachmentSizeMismatchError(AttachmentDeliveryError):
-    """Raised when Graph metadata and delivered bytes disagree."""
+    """Raised when Graph attachment metadata is internally invalid.
+
+    Note: this never compares the delivered decoded byte count to Graph's
+    declared ``size`` field. Graph reports the MIME/base64-encoded size while
+    the raw ``$value`` endpoint returns decoded bytes, so the two legitimately
+    differ. It only guards against nonsensical metadata (e.g. a negative size).
+    """
 
     code = "attachment_size_mismatch"
+
+
+class AttachmentIntegrityError(AttachmentDeliveryError):
+    """Raised when delivered bytes fail structural integrity validation.
+
+    The delivered file is preserved on disk (never deleted) so a false-positive
+    gate can never destroy valid data; ``path`` names where the bytes were kept.
+    """
+
+    code = "attachment_integrity_failed"
+
+    def __init__(self, filename: str, path: str, reason: str):
+        self.filename = filename
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            f"{self.code}: delivered attachment {filename!r} failed integrity "
+            f"validation ({reason}); the bytes were preserved for inspection "
+            f"at {path}"
+        )
+
+
+# Structural integrity is validated from magic-number signatures, not by fully
+# parsing content. We key off the delivered bytes themselves rather than Graph's
+# declared content type, since a content type can misdescribe the payload.
+_INTEGRITY_HEADER_BYTES = 8
+_INTEGRITY_TAIL_BYTES = 2048
+_PDF_MAGIC = b"%PDF-"
+_PDF_EOF = b"%%EOF"
+_ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_ZIP_EOCD = b"PK\x05\x06"
+
+
+def _verify_delivered_integrity(
+    *,
+    filename: str,
+    path: str,
+    header: bytes,
+    tail: bytes,
+    delivered_size: int,
+    has_declared_size: bool,
+    declared_size: int,
+) -> None:
+    """Validate delivered bytes on their own terms, never against the MIME size.
+
+    Confirms structural integrity for formats the payload's own magic bytes
+    identify (PDF trailer, ZIP end-of-central-directory), which catches genuine
+    truncation. Unknown formats carry no structural claim and pass on the hash
+    alone. Raises :class:`AttachmentIntegrityError` (leaving the file in place)
+    when a recognized container is truncated.
+    """
+    if has_declared_size and declared_size > 0 and delivered_size == 0:
+        # Graph expected content but the raw endpoint returned nothing.
+        raise AttachmentIntegrityError(
+            filename, path, "delivered zero bytes for a non-empty attachment"
+        )
+    if header.startswith(_PDF_MAGIC):
+        if _PDF_EOF not in tail:
+            raise AttachmentIntegrityError(
+                filename, path, "PDF is missing its %%EOF trailer (truncated)"
+            )
+    elif any(header.startswith(magic) for magic in _ZIP_MAGICS):
+        if _ZIP_EOCD not in tail:
+            raise AttachmentIntegrityError(
+                filename,
+                path,
+                "ZIP container is missing its end-of-central-directory "
+                "record (truncated)",
+            )
 
 
 class UnsafeAttachmentDestinationError(AttachmentDeliveryError):
@@ -840,6 +915,7 @@ async def _download_file_attachment(
     temporary_fd: int | None = None
     final_name: str | None = None
     reservation_fd: int | None = None
+    delivered = False
 
     try:
         temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -859,6 +935,8 @@ async def _download_file_attachment(
         )
         delivered_size = 0
         digest = hashlib.sha256()
+        header = b""
+        tail = b""
 
         with os.fdopen(temporary_fd, "wb", closefd=True) as output:
             temporary_fd = None
@@ -885,14 +963,11 @@ async def _download_file_attachment(
                             )
                         output.write(chunk)
                         digest.update(chunk)
+                        if len(header) < _INTEGRITY_HEADER_BYTES:
+                            header += chunk[: _INTEGRITY_HEADER_BYTES - len(header)]
+                        tail = (tail + chunk)[-_INTEGRITY_TAIL_BYTES:]
             output.flush()
             os.fsync(output.fileno())
-
-        if has_declared_size and delivered_size != declared_size:
-            raise AttachmentSizeMismatchError(
-                f"Graph declared {declared_size} bytes but delivered "
-                f"{delivered_size} bytes"
-            )
 
         safe_name = _sanitize_attachment_filename(
             str(attachment.get("name") or "unnamed-attachment")
@@ -910,6 +985,20 @@ async def _download_file_attachment(
             dst_dir_fd=directory_fd,
         )
         temporary_name = ""
+        # The bytes are now on disk under their final name. Any validation from
+        # here on must never delete them, so a false-positive gate can never
+        # destroy valid data.
+        delivered = True
+
+        _verify_delivered_integrity(
+            filename=str(attachment.get("name") or "unnamed-attachment"),
+            path=str(destination / final_name),
+            header=header,
+            tail=tail,
+            delivered_size=delivered_size,
+            has_declared_size=has_declared_size,
+            declared_size=declared_size,
+        )
 
         return {
             "id": attachment["id"],
@@ -928,7 +1017,11 @@ async def _download_file_attachment(
         if reservation_fd is not None:
             os.close(reservation_fd)
         _unlink_if_present(temporary_name, directory_fd)
-        _unlink_if_present(final_name, directory_fd)
+        # Once the bytes are delivered under their final name they are never
+        # removed, even on a validation failure: the caller must be able to
+        # inspect what actually arrived.
+        if not delivered:
+            _unlink_if_present(final_name, directory_fd)
         raise
     finally:
         os.close(directory_fd)
@@ -951,9 +1044,15 @@ async def download_attachment(
         max_bytes: Maximum delivered byte count (default 100 MiB).
         timeout_seconds: Total request timeout in seconds (default 30).
 
-    The response contains metadata only. The server never opens, parses, or
-    executes the bytes. Consumers own quarantine policy and processed-ID state.
-    Only fileAttachment, including inline files, is downloadable.
+    The response contains metadata only (including a sha256 of the delivered
+    bytes). Delivered bytes are validated on their own terms - hashed, and
+    structurally integrity-checked from their own magic-number signatures to
+    catch truncation - never by comparing the decoded byte count to Graph's
+    MIME/base64 ``size`` field, which legitimately differs. The server never
+    fully parses or executes the bytes, and never deletes a delivered file: a
+    payload that fails integrity is preserved on disk and the error names it.
+    Consumers own quarantine policy and processed-ID state. Only fileAttachment,
+    including inline files, is downloadable.
     """
     async with asyncio.timeout(timeout_seconds):
         attachment = await _graph_get(
