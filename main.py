@@ -1,8 +1,14 @@
-"""Outlook MCP Server — client credentials flow, no token expiry."""
+"""Outlook MCP Server - client credentials flow, no token expiry."""
 
+import asyncio
+import hashlib
 import json
 import os
+import stat
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 import httpx
 import msal
@@ -18,6 +24,29 @@ USER_EMAIL = os.environ["OUTLOOK_USER_EMAIL"]
 
 GRAPH_BASE = f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}"
 GRAPH_TIMEOUT = 30.0
+
+# Client-credential tokens use Graph's mandatory ``.default`` scope. These
+# constants are the authoritative application-permission contract for the Azure
+# registration and are regression-tested to remain read-only.
+READ_ONLY_GRAPH_PERMISSIONS = frozenset(
+    {"Mail.Read", "Mail.ReadBasic", "Calendars.Read", "Contacts.Read"}
+)
+REQUESTED_GRAPH_PERMISSIONS = frozenset(
+    {"Mail.Read", "Calendars.Read", "Contacts.Read"}
+)
+READ_ONLY_MAIL_PERMISSIONS = frozenset(
+    permission
+    for permission in READ_ONLY_GRAPH_PERMISSIONS
+    if permission.startswith("Mail.")
+)
+REQUESTED_MAIL_PERMISSIONS = frozenset(
+    permission
+    for permission in REQUESTED_GRAPH_PERMISSIONS
+    if permission.startswith("Mail.")
+)
+
+DEFAULT_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024
+DEFAULT_ATTACHMENT_TIMEOUT_SECONDS = 30.0
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -42,7 +71,7 @@ def _get_token() -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP client lifecycle — single client reused across all tool calls
+# HTTP client lifecycle - single client reused across all tool calls
 # ---------------------------------------------------------------------------
 _http: httpx.AsyncClient | None = None
 
@@ -65,11 +94,26 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {_get_token()}"}
 
 
-async def _graph_get(path: str, params: dict | None = None) -> dict:
-    r = await _http.get(path, headers=_auth_headers(), params=params)
+async def _graph_get(
+    path: str,
+    params: dict | None = None,
+    timeout: float | None = None,
+) -> dict:
+    request_options: dict = {
+        "headers": _auth_headers(),
+        "params": params,
+    }
+    if timeout is not None:
+        request_options["timeout"] = timeout
+    r = await _http.get(path, **request_options)
     if r.status_code >= 400:
         _raise_graph_error(r)
     return r.json()
+
+
+def _graph_path_segment(value: str) -> str:
+    """Encode an opaque Graph identifier as one URL path segment."""
+    return quote(value, safe="")
 
 
 async def _graph_post(path: str, body: dict) -> dict:
@@ -95,7 +139,9 @@ def _raise_graph_error(r: httpx.Response):
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
-_MSG_LIST_FIELDS = "id,internetMessageId,subject,from,receivedDateTime,isRead,hasAttachments"
+_MSG_LIST_FIELDS = (
+    "id,internetMessageId,subject,from,receivedDateTime,isRead,hasAttachments"
+)
 _MSG_FULL_FIELDS = f"{_MSG_LIST_FIELDS},body,toRecipients,ccRecipients"
 
 
@@ -224,11 +270,14 @@ async def search_emails(query: str, top: int = 20) -> str:
         top: Max results (max 50).
     """
     top = min(top, 50)
-    data = await _graph_get("/messages", params={
-        "$search": f'"{query}"',
-        "$top": str(top),
-        "$select": _MSG_LIST_FIELDS,
-    })
+    data = await _graph_get(
+        "/messages",
+        params={
+            "$search": f'"{query}"',
+            "$top": str(top),
+            "$select": _MSG_LIST_FIELDS,
+        },
+    )
     return json.dumps([_fmt_message(m) for m in data.get("value", [])], indent=1)
 
 
@@ -305,18 +354,24 @@ async def file_emails(moves: list[dict]) -> str:
                 f"/messages/{email_id}/move",
                 {"destinationId": dest_id},
             )
-            results.append({
-                "email_id": email_id,
-                "new_id": data.get("id", ""),
-                "internet_message_id": data.get("internetMessageId", ""),
-                "folder": folder_path,
-                "status": "filed",
-            })
+            results.append(
+                {
+                    "email_id": email_id,
+                    "new_id": data.get("id", ""),
+                    "internet_message_id": data.get("internetMessageId", ""),
+                    "folder": folder_path,
+                    "status": "filed",
+                }
+            )
         except RuntimeError as e:
-            results.append({"email_id": email_id, "folder": folder_path, "status": f"error: {e}"})
+            results.append(
+                {"email_id": email_id, "folder": folder_path, "status": f"error: {e}"}
+            )
 
     filed = sum(1 for r in results if r["status"] == "filed")
-    return json.dumps({"filed": filed, "total": len(results), "results": results}, indent=1)
+    return json.dumps(
+        {"filed": filed, "total": len(results), "results": results}, indent=1
+    )
 
 
 @mcp.tool()
@@ -331,11 +386,13 @@ async def move_email(message_id: str, destination_folder_id: str) -> str:
         f"/messages/{message_id}/move",
         {"destinationId": destination_folder_id},
     )
-    return json.dumps({
-        "status": "moved",
-        "id": data["id"],
-        "to_folder": destination_folder_id,
-    })
+    return json.dumps(
+        {
+            "status": "moved",
+            "id": data["id"],
+            "to_folder": destination_folder_id,
+        }
+    )
 
 
 @mcp.tool()
@@ -377,7 +434,7 @@ async def delete_folder(folder_id: str, force: bool = False) -> str:
     """Delete a mail folder.
 
     By default, refuses to delete folders that contain messages or child
-    folders — move them out first with move_email/file_emails. Pass
+    folders - move them out first with move_email/file_emails. Pass
     force=True to delete anyway (contents go to Deleted Items).
 
     Args:
@@ -392,14 +449,17 @@ async def delete_folder(folder_id: str, force: bool = False) -> str:
         total = info.get("totalItemCount", 0)
         children = info.get("childFolderCount", 0)
         if total > 0 or children > 0:
-            return json.dumps({
-                "status": "refused",
-                "reason": "folder not empty",
-                "name": info.get("displayName", ""),
-                "totalItemCount": total,
-                "childFolderCount": children,
-                "hint": "move messages out first, or pass force=True",
-            }, indent=1)
+            return json.dumps(
+                {
+                    "status": "refused",
+                    "reason": "folder not empty",
+                    "name": info.get("displayName", ""),
+                    "totalItemCount": total,
+                    "childFolderCount": children,
+                    "hint": "move messages out first, or pass force=True",
+                },
+                indent=1,
+            )
 
     r = await _http.delete(
         f"/mailFolders/{folder_id}",
@@ -457,22 +517,27 @@ async def suggest_folders(top: int = 50) -> str:
         top: Number of recent inbox emails to analyze (max 200).
     """
     top = min(top, 200)
-    data = await _graph_get("/mailFolders/inbox/messages", params={
-        "$top": str(top),
-        "$orderby": "receivedDateTime desc",
-        "$select": "id,subject,from,receivedDateTime",
-    })
+    data = await _graph_get(
+        "/mailFolders/inbox/messages",
+        params={
+            "$top": str(top),
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,from,receivedDateTime",
+        },
+    )
 
     groups: dict[str, list[dict]] = {}
     for m in data.get("value", []):
         addr = m.get("from", {}).get("emailAddress", {}).get("address", "unknown")
         domain = addr.rsplit("@", 1)[-1] if "@" in addr else "unknown"
-        groups.setdefault(domain, []).append({
-            "id": m["id"],
-            "subject": m.get("subject", ""),
-            "from": addr,
-            "received": m.get("receivedDateTime", ""),
-        })
+        groups.setdefault(domain, []).append(
+            {
+                "id": m["id"],
+                "subject": m.get("subject", ""),
+                "from": addr,
+                "received": m.get("receivedDateTime", ""),
+            }
+        )
 
     ranked = [
         {
@@ -484,7 +549,9 @@ async def suggest_folders(top: int = 50) -> str:
         for domain, msgs in sorted(groups.items(), key=lambda x: -len(x[1]))
     ]
 
-    return json.dumps({"analyzed": len(data.get("value", [])), "by_domain": ranked}, indent=1)
+    return json.dumps(
+        {"analyzed": len(data.get("value", [])), "by_domain": ranked}, indent=1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -549,51 +616,372 @@ async def forward_email(
 # ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------
-_ATTACH_LIST_FIELDS = "id,name,contentType,size"
+_ATTACH_LIST_FIELDS = "id,name,contentType,size,isInline"
+_ATTACHMENT_KINDS = frozenset(
+    {"fileAttachment", "itemAttachment", "referenceAttachment"}
+)
 
 
-def _fmt_attachment(a: dict, full: bool = False) -> dict:
-    out = {
+class AttachmentDeliveryError(RuntimeError):
+    """Base class for typed attachment-delivery failures."""
+
+    code = "attachment_delivery_error"
+
+
+class UnsupportedAttachmentKindError(AttachmentDeliveryError):
+    """Raised when Graph cannot provide a supported file payload."""
+
+    code = "unsupported_attachment_kind"
+
+    def __init__(self, attachment_id: str, kind: str) -> None:
+        self.attachment_id = attachment_id
+        self.kind = kind
+        super().__init__(
+            f"{self.code}: attachment {attachment_id!r} has kind {kind!r}; "
+            "only fileAttachment downloads are supported"
+        )
+
+
+class AttachmentTooLargeError(AttachmentDeliveryError):
+    """Raised before a download can exceed the configured decoded-size cap."""
+
+    code = "attachment_too_large"
+
+
+class AttachmentSizeMismatchError(AttachmentDeliveryError):
+    """Raised when Graph metadata and delivered bytes disagree."""
+
+    code = "attachment_size_mismatch"
+
+
+class UnsafeAttachmentDestinationError(AttachmentDeliveryError):
+    """Raised when a destination cannot be used without following a symlink."""
+
+    code = "unsafe_attachment_destination"
+
+
+def _attachment_kind(attachment: dict) -> str:
+    odata_type = str(attachment.get("@odata.type", ""))
+    kind = odata_type.rsplit(".", 1)[-1].lstrip("#")
+    return kind if kind in _ATTACHMENT_KINDS else "unknownAttachment"
+
+
+def _fmt_attachment(a: dict) -> dict:
+    return {
         "id": a["id"],
         "name": a.get("name", "unnamed"),
         "contentType": a.get("contentType", ""),
         "size": a.get("size", 0),
+        "kind": _attachment_kind(a),
+        "isInline": bool(a.get("isInline", False)),
     }
-    if full:
-        out["contentBytes"] = a.get("contentBytes", "")
-    return out
+
+
+def _validate_graph_next_link(next_link: str) -> str:
+    """Keep bearer credentials on Microsoft Graph while following pagination."""
+    parsed = urlsplit(next_link)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != "https" or parsed.hostname != "graph.microsoft.com":
+            raise RuntimeError("Graph pagination returned an untrusted nextLink")
+    elif not next_link.startswith("/"):
+        raise RuntimeError("Graph pagination returned an invalid nextLink")
+    return next_link
+
+
+async def _list_all_attachments(message_id: str) -> list[dict]:
+    path = f"/messages/{_graph_path_segment(message_id)}/attachments"
+    params: dict | None = {"$select": _ATTACH_LIST_FIELDS}
+    attachments: list[dict] = []
+    seen_links: set[str] = set()
+
+    while path:
+        data = await _graph_get(path, params=params)
+        attachments.extend(data.get("value", []))
+        next_link = data.get("@odata.nextLink")
+        if not next_link:
+            break
+        path = _validate_graph_next_link(str(next_link))
+        if path in seen_links:
+            raise RuntimeError("Graph pagination returned a repeated nextLink")
+        seen_links.add(path)
+        params = None
+
+    return attachments
 
 
 @mcp.tool()
 async def list_attachments(message_id: str) -> str:
-    """List attachments on an email.
+    """List every attachment on an email, following Graph pagination.
 
     Args:
         message_id: ID of the email.
+
+    Returns file, inline file, item, and reference attachment metadata. Item
+    and reference attachments are visible here but cannot be downloaded.
     """
-    data = await _graph_get(
-        f"/messages/{message_id}/attachments",
-        params={"$select": _ATTACH_LIST_FIELDS},
+    attachments = await _list_all_attachments(message_id)
+    return json.dumps([_fmt_attachment(a) for a in attachments], indent=1)
+
+
+def _sanitize_attachment_filename(filename: str) -> str:
+    """Return one safe path segment while preserving ordinary filenames."""
+    sanitized = filename.replace("/", "_").replace("\\", "_")
+    sanitized = "".join(
+        "_" if ord(character) < 32 or ord(character) == 127 else character
+        for character in sanitized
     )
-    return json.dumps([_fmt_attachment(a) for a in data.get("value", [])], indent=1)
+    while ".." in sanitized:
+        sanitized = sanitized.replace("..", "_")
+    sanitized = sanitized.replace("\x00", "_")
+    if sanitized in {"", ".", ".."}:
+        return "unnamed-attachment"
+    return sanitized
+
+
+def _safe_destination_directory(destination_directory: str) -> Path:
+    if not destination_directory or "\x00" in destination_directory:
+        raise UnsafeAttachmentDestinationError("Invalid destination directory")
+
+    requested_destination = Path(destination_directory).expanduser().absolute()
+    try:
+        requested_info = requested_destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(requested_info.st_mode):
+            raise UnsafeAttachmentDestinationError(
+                "Destination directory cannot be a symlink"
+            )
+
+    destination = requested_destination.resolve(strict=False)
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        info = destination.lstat()
+    except OSError as error:
+        raise UnsafeAttachmentDestinationError(
+            f"Cannot inspect destination directory: {error}"
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise UnsafeAttachmentDestinationError(
+            "Destination must be a real directory, not a symlink or file"
+        )
+    return destination
+
+
+def _deduplicated_filename(directory_fd: int, filename: str) -> tuple[str, int]:
+    suffix = Path(filename).suffix
+    stem = filename[: -len(suffix)] if suffix else filename
+    collision_number = 0
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    while True:
+        candidate = (
+            filename
+            if collision_number == 0
+            else f"{stem} ({collision_number}){suffix}"
+        )
+        try:
+            reservation_fd = os.open(
+                candidate,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            return candidate, reservation_fd
+        except FileExistsError:
+            collision_number += 1
+
+
+def _unlink_if_present(filename: str | None, directory_fd: int) -> None:
+    if not filename:
+        return
+    try:
+        os.unlink(filename, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
+async def _download_file_attachment(
+    message_id: str,
+    attachment: dict,
+    destination_directory: str,
+    max_bytes: int,
+    timeout_seconds: float,
+) -> dict:
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be greater than zero")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than zero")
+
+    has_declared_size = attachment.get("size") is not None
+    declared_size = int(attachment.get("size", 0) or 0)
+    if declared_size < 0:
+        raise AttachmentSizeMismatchError(
+            f"Graph declared an invalid attachment size of {declared_size} bytes"
+        )
+    if declared_size > max_bytes:
+        raise AttachmentTooLargeError(
+            f"Attachment declares {declared_size} bytes, above the "
+            f"{max_bytes}-byte limit"
+        )
+
+    destination = _safe_destination_directory(destination_directory)
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(destination, directory_flags)
+    temporary_name = f".attachment-{uuid.uuid4().hex}.partial"
+    temporary_fd: int | None = None
+    final_name: str | None = None
+    reservation_fd: int | None = None
+
+    try:
+        temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            temporary_flags |= os.O_NOFOLLOW
+        temporary_fd = os.open(
+            temporary_name,
+            temporary_flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+
+        attachment_id = str(attachment["id"])
+        raw_path = (
+            f"/messages/{_graph_path_segment(message_id)}/attachments/"
+            f"{_graph_path_segment(attachment_id)}/$value"
+        )
+        delivered_size = 0
+        digest = hashlib.sha256()
+
+        with os.fdopen(temporary_fd, "wb", closefd=True) as output:
+            temporary_fd = None
+            async with asyncio.timeout(timeout_seconds):
+                async with _http.stream(
+                    "GET",
+                    raw_path,
+                    headers=_auth_headers(),
+                    timeout=httpx.Timeout(timeout_seconds),
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        _raise_graph_error(response)
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > max_bytes:
+                        raise AttachmentTooLargeError(
+                            f"Attachment response exceeds the {max_bytes}-byte limit"
+                        )
+                    async for chunk in response.aiter_bytes():
+                        delivered_size += len(chunk)
+                        if delivered_size > max_bytes:
+                            raise AttachmentTooLargeError(
+                                f"Attachment exceeded the {max_bytes}-byte limit"
+                            )
+                        output.write(chunk)
+                        digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+
+        if has_declared_size and delivered_size != declared_size:
+            raise AttachmentSizeMismatchError(
+                f"Graph declared {declared_size} bytes but delivered "
+                f"{delivered_size} bytes"
+            )
+
+        safe_name = _sanitize_attachment_filename(
+            str(attachment.get("name") or "unnamed-attachment")
+        )
+        final_name, reservation_fd = _deduplicated_filename(
+            directory_fd,
+            safe_name,
+        )
+        os.close(reservation_fd)
+        reservation_fd = None
+        os.replace(
+            temporary_name,
+            final_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = ""
+
+        return {
+            "id": attachment["id"],
+            "originalFilename": str(attachment.get("name") or "unnamed-attachment"),
+            "filename": final_name,
+            "path": str(destination / final_name),
+            "contentType": attachment.get("contentType", ""),
+            "size": delivered_size,
+            "sha256": digest.hexdigest(),
+            "kind": "fileAttachment",
+            "isInline": bool(attachment.get("isInline", False)),
+        }
+    except BaseException:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if reservation_fd is not None:
+            os.close(reservation_fd)
+        _unlink_if_present(temporary_name, directory_fd)
+        _unlink_if_present(final_name, directory_fd)
+        raise
+    finally:
+        os.close(directory_fd)
 
 
 @mcp.tool()
-async def get_attachment(message_id: str, attachment_id: str) -> str:
-    """Download an attachment's content (base64-encoded).
+async def download_attachment(
+    message_id: str,
+    attachment_id: str,
+    destination_directory: str,
+    max_bytes: int = DEFAULT_ATTACHMENT_MAX_BYTES,
+    timeout_seconds: float = DEFAULT_ATTACHMENT_TIMEOUT_SECONDS,
+) -> str:
+    """Deliver a file attachment byte-faithfully to a local directory.
 
     Args:
         message_id: ID of the email.
         attachment_id: ID of the attachment (use list_attachments to find IDs).
+        destination_directory: Caller-selected local quarantine or intake directory.
+        max_bytes: Maximum delivered byte count (default 100 MiB).
+        timeout_seconds: Total request timeout in seconds (default 30).
+
+    The response contains metadata only. The server never opens, parses, or
+    executes the bytes. Consumers own quarantine policy and processed-ID state.
+    Only fileAttachment, including inline files, is downloadable.
     """
-    data = await _graph_get(f"/messages/{message_id}/attachments/{attachment_id}")
-    return json.dumps(_fmt_attachment(data, full=True), indent=1)
+    async with asyncio.timeout(timeout_seconds):
+        attachment = await _graph_get(
+            (
+                f"/messages/{_graph_path_segment(message_id)}/attachments/"
+                f"{_graph_path_segment(attachment_id)}"
+            ),
+            params={"$select": _ATTACH_LIST_FIELDS},
+            timeout=timeout_seconds,
+        )
+    kind = _attachment_kind(attachment)
+    if kind != "fileAttachment":
+        raise UnsupportedAttachmentKindError(attachment_id, kind)
+
+    response = await _download_file_attachment(
+        message_id=message_id,
+        attachment=attachment,
+        destination_directory=destination_directory,
+        max_bytes=max_bytes,
+        timeout_seconds=timeout_seconds,
+    )
+    return json.dumps(response, indent=1)
 
 
 # ---------------------------------------------------------------------------
 # Contacts
 # ---------------------------------------------------------------------------
-_CONTACT_FIELDS = "id,displayName,emailAddresses,companyName,jobTitle,mobilePhone,businessPhones"
+_CONTACT_FIELDS = (
+    "id,displayName,emailAddresses,companyName,jobTitle,mobilePhone,businessPhones"
+)
 
 
 def _fmt_contact(c: dict) -> dict:
@@ -617,11 +1005,14 @@ async def list_contacts(top: int = 50) -> str:
         top: Max contacts to return (max 100).
     """
     top = min(top, 100)
-    data = await _graph_get("/contacts", params={
-        "$top": str(top),
-        "$orderby": "displayName",
-        "$select": _CONTACT_FIELDS,
-    })
+    data = await _graph_get(
+        "/contacts",
+        params={
+            "$top": str(top),
+            "$orderby": "displayName",
+            "$select": _CONTACT_FIELDS,
+        },
+    )
     return json.dumps([_fmt_contact(c) for c in data.get("value", [])], indent=1)
 
 
@@ -634,18 +1025,23 @@ async def search_contacts(query: str, top: int = 20) -> str:
         top: Max results (max 50).
     """
     top = min(top, 50)
-    data = await _graph_get("/contacts", params={
-        "$search": f'"{query}"',
-        "$top": str(top),
-        "$select": _CONTACT_FIELDS,
-    })
+    data = await _graph_get(
+        "/contacts",
+        params={
+            "$search": f'"{query}"',
+            "$top": str(top),
+            "$select": _CONTACT_FIELDS,
+        },
+    )
     return json.dumps([_fmt_contact(c) for c in data.get("value", [])], indent=1)
 
 
 # ---------------------------------------------------------------------------
 # Calendar helpers
 # ---------------------------------------------------------------------------
-_EVENT_LIST_FIELDS = "id,subject,start,end,location,organizer,attendees,isOnlineMeeting,webLink"
+_EVENT_LIST_FIELDS = (
+    "id,subject,start,end,location,organizer,attendees,isOnlineMeeting,webLink"
+)
 _EVENT_FULL_FIELDS = f"{_EVENT_LIST_FIELDS},body,onlineMeeting"
 
 
@@ -694,13 +1090,16 @@ async def list_events(
         top: Max events to return (max 50).
     """
     top = min(top, 50)
-    data = await _graph_get("/calendarView", params={
-        "startDateTime": start,
-        "endDateTime": end,
-        "$top": str(top),
-        "$orderby": "start/dateTime",
-        "$select": _EVENT_LIST_FIELDS,
-    })
+    data = await _graph_get(
+        "/calendarView",
+        params={
+            "startDateTime": start,
+            "endDateTime": end,
+            "$top": str(top),
+            "$orderby": "start/dateTime",
+            "$select": _EVENT_LIST_FIELDS,
+        },
+    )
     return json.dumps([_fmt_event(e) for e in data.get("value", [])], indent=1)
 
 

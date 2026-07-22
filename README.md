@@ -1,10 +1,13 @@
 # Outlook MCP Server
 
-MCP server for Microsoft 365 email, calendar, and contacts using client credentials flow. Auth never expires — no browser login, no token refresh needed.
+MCP server for Microsoft 365 email, calendar, and contacts using client credentials flow.
+Authentication does not require browser login or delegated-token refresh.
 
 ## Why this exists
 
-Off-the-shelf Microsoft 365 MCP servers use delegated auth (device code flow), which expires and requires re-login. They also load 130+ tool schemas into every conversation even when you only need email. This server uses application permissions via MSAL — authenticate once at the Azure level, and it works forever.
+Off-the-shelf Microsoft 365 MCP servers use delegated auth (device code flow), which expires and requires re-login.
+They also load 130+ tool schemas into every conversation even when you only need email.
+This server uses application permissions via MSAL.
 
 ## Azure AD Setup
 
@@ -18,18 +21,23 @@ Under **API Permissions > Add a permission > Microsoft Graph > Application permi
 
 | Permission | Purpose |
 |-----------|---------|
-| `Mail.ReadWrite` | Read emails, move between folders, manage folders, attachments |
-| `Mail.Send` | Send, reply, forward emails |
-| `Calendars.ReadWrite` | List, create, delete calendar events |
+| `Mail.Read` | Read emails and pull attachments without mailbox mutation |
+| `Calendars.Read` | List calendar events |
 | `Contacts.Read` | List and search contacts |
 
 ### 3. Grant admin consent
 
-Click **Grant admin consent for [your tenant]**. All four permissions must show a green checkmark.
+Click **Grant admin consent for [your tenant]**.
+All three permissions must show a green checkmark.
+
+The permission set above is intentionally read-only and is enforced by a regression test against the constants in `main.py`.
+Mutation tools retained for existing installations will be rejected by Graph under this profile.
+Do not add a write-capable application permission to an intake deployment.
 
 ### 4. Create a client secret
 
-Under **Certificates & secrets > New client secret**. Copy the value immediately — you won't see it again.
+Under **Certificates & secrets > New client secret**.
+Copy the value immediately because it is shown only once.
 
 ## Install
 
@@ -83,7 +91,7 @@ Add to `%APPDATA%/Claude/claude_desktop_config.json` (Windows) or `~/Library/App
 }
 ```
 
-## Tools (19)
+## Tools (21)
 
 ### Email
 
@@ -110,6 +118,13 @@ read_email(message_id="AAMkAG...")
 ```
 
 Returns: subject, from, to, cc, body (HTML/text), attachments flag.
+
+#### `list_folder_messages`
+List messages in any mail folder, with an optional lower date bound.
+
+```
+list_folder_messages(folder_id="AAMkAG...", top=50, since="2026-04-01")
+```
 
 #### `search_emails`
 Keyword search across subject, body, and sender.
@@ -145,7 +160,7 @@ Forward an email to new recipients.
 forward_email(
     message_id="AAMkAG...",
     to=["colleague@example.com"],
-    body="FYI — see below."
+    body="FYI - see below."
 )
 ```
 
@@ -185,20 +200,39 @@ Creates `Clients/Acme` as a nested folder if it doesn't exist. Returns count of 
 ### Attachments
 
 #### `list_attachments`
-List attachments on an email.
+List every attachment on an email.
+The tool follows every Graph `@odata.nextLink`, including pages after the first.
 
 ```
 list_attachments(message_id="AAMkAG...")
 ```
 
-Returns: id, name, contentType, size (bytes).
+Returns: id, name, contentType, size (bytes), kind, and inline status.
+The kind is `fileAttachment`, `itemAttachment`, or `referenceAttachment`.
 
-#### `get_attachment`
-Download an attachment (base64-encoded content).
+#### `download_attachment`
+Deliver a file attachment to a caller-selected local directory.
+The file bytes are streamed directly from Graph's raw attachment endpoint and never enter the MCP response.
 
 ```
-get_attachment(message_id="AAMkAG...", attachment_id="AAMkAG...")
+download_attachment(
+    message_id="AAMkAG...",
+    attachment_id="AAMkAG...",
+    destination_directory="/path/to/quarantine",
+)
 ```
+
+Returns only delivery metadata: original filename, saved filename and path, content type, delivered byte size, SHA-256, attachment kind, and inline status.
+Ordinary filenames are preserved.
+Unsafe path characters and traversal sequences are sanitized, collisions receive numeric suffixes, existing files are never overwritten, and incomplete temporary files are removed.
+
+The default decoded-size limit is 100 MiB and the default total download timeout is 30 seconds.
+Callers can lower either limit with `max_bytes` and `timeout_seconds`.
+Inline `fileAttachment` values are supported.
+Downloads of `itemAttachment` and `referenceAttachment` fail with the typed `unsupported_attachment_kind` error.
+
+The server writes bytes only and never opens, parses, or executes them.
+The caller owns quarantine policy and its processed-message or processed-attachment ID ledger.
 
 ### Folders
 
@@ -217,6 +251,13 @@ Create a new mail folder.
 ```
 create_folder(name="Invoices")
 create_folder(name="2026", parent_folder_id="AAMkAG...")  # nested
+```
+
+#### `delete_folder`
+Delete an empty mail folder, or pass `force=True` to delete a non-empty folder.
+
+```
+delete_folder(folder_id="AAMkAG...")
 ```
 
 ### Calendar
@@ -265,7 +306,7 @@ create_event(
 | `subject` | str | required | Event title |
 | `start` | str | required | Start datetime (ISO 8601) |
 | `end` | str | required | End datetime (ISO 8601) |
-| `attendees` | list[str] | None | Email addresses — sends invites |
+| `attendees` | list[str] | None | Email addresses - sends invites |
 | `location` | str | None | Location name |
 | `body` | str | None | Description/agenda |
 | `body_type` | str | "Text" | "Text" or "HTML" |
