@@ -6,6 +6,8 @@ import json
 import os
 import signal
 import stat
+import threading
+import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
@@ -1274,32 +1276,68 @@ async def delete_event(event_id: str) -> str:
     return json.dumps({"status": "deleted", "id": event_id})
 
 
+# How long a signalled shutdown may spend unwinding before we stop waiting on
+# it. The clean unwind finishes in milliseconds; anything still running after
+# this is wedged on the uncancellable stdin read and never will finish.
+_SHUTDOWN_GRACE_SECONDS = 2.0
+
+# Set by the signal handler to arm the watchdog. Module scope so the watchdog
+# thread and the handler share one object without a closure cell.
+_shutdown_requested = threading.Event()
+
+
 def _run_stdio() -> None:
-    """Serve over stdio, then exit without interpreter finalization.
+    """Serve over stdio, then leave without interpreter finalization.
 
-    Every disconnect path - stdin EOF (the normal client-disconnect), SIGINT,
-    and SIGTERM - unwinds the stdio transport and the httpx-closing lifespan
-    (`_lifespan`) cleanly inside ``mcp.run``. Only once that cleanup has
-    completed do we skip interpreter finalization with ``os._exit``.
+    Two separate hazards live at shutdown, both caused by the same thing: the
+    anyio stdio transport reads stdin on a worker thread, that thread blocks in
+    ``readline`` holding the ``BufferedReader`` lock, and it cannot be
+    cancelled (``to_thread.run_sync`` is not cancellable).
 
-    Why skip finalization: the anyio stdio transport drives stdin/stdout
-    through a worker thread that can still be blocked mid-``readline`` (holding
-    the buffered-stream lock) at exit time. If CPython finalizes, it deallocates
-    the stdin/stdout ``TextIOWrapper`` and ``_enter_buffered_busy`` fails to
-    acquire that lock, raising a fatal error and ``abort()`` (SIGABRT). That
-    self-abort produced a near-daily macOS crash report. ``os._exit(0)`` after
-    clean shutdown sidesteps the race entirely. This remedy is derived locally
-    from the diagnosed mechanism: there is no upstream python-sdk issue tracking
-    this abort as of mcp 1.26.0 (issue #575 is an unrelated Windows cleanup bug;
-    #1933 is a different, ValueError-on-closed-stdio symptom).
+    1. Aborting. If CPython finalizes while the worker still holds the buffer
+       lock, ``finalize_modules`` deallocates a stdio ``TextIOWrapper``, its
+       close reaches ``_enter_buffered_busy``, that fails to acquire the lock
+       and calls ``Py_FatalError`` -> ``abort()`` (SIGABRT), which macOS turns
+       into a "Python quit unexpectedly" crash report. Skipping finalization
+       with ``os._exit`` removes the hazard entirely.
+
+    2. Wedging. On stdin EOF and on SIGTERM the transport and the
+       httpx-closing lifespan (``_lifespan``) unwind cleanly, ``mcp.run``
+       returns, and ``os._exit(0)`` below runs. On SIGINT it does not:
+       anyio cancels the task group, then waits forever for the stdin worker
+       that cannot be cancelled. ``mcp.run`` never returns, so the ``os._exit``
+       below is unreachable and the server hangs until something kills it.
+
+    So a signalled shutdown arms a watchdog before raising KeyboardInterrupt.
+    The clean unwind wins the race in the normal case and exits below with
+    httpx closed; if it wedges, the watchdog leaves without finalization -
+    still no abort, and no hang either.
+
+    This remedy is derived locally from the diagnosed mechanism: there is no
+    upstream python-sdk issue tracking either symptom as of mcp 1.26.0 (issue
+    #575 is an unrelated Windows cleanup bug; #1933 is a different,
+    ValueError-on-closed-stdio symptom).
     """
 
+    def _watchdog() -> None:
+        _shutdown_requested.wait()
+        time.sleep(_SHUTDOWN_GRACE_SECONDS)
+        # Reached only if the unwind is wedged: exit code stays 0 because the
+        # server did its work and the client has already disconnected.
+        os._exit(0)
+
+    # Started up front, not from the handler: creating a thread inside a signal
+    # handler can deadlock against a thread-start already in progress.
+    threading.Thread(target=_watchdog, name="shutdown-watchdog", daemon=True).start()
+
     def _terminate(signum: int, frame: object) -> None:
-        # Re-raise SIGTERM as KeyboardInterrupt so anyio unwinds the transport
-        # and runs the lifespan httpx cleanup exactly as it does for Ctrl+C.
+        # Re-raise as KeyboardInterrupt so anyio unwinds the transport and runs
+        # the lifespan httpx cleanup exactly as it does for Ctrl+C.
+        _shutdown_requested.set()
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
 
     try:
         mcp.run(transport="stdio")
