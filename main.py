@@ -1,8 +1,10 @@
 """Outlook MCP Server - client credentials flow, no token expiry."""
 
 import asyncio
+import base64
 import hashlib
 import json
+import mimetypes
 import os
 import signal
 import stat
@@ -129,6 +131,17 @@ async def _graph_post(path: str, body: dict) -> dict:
     if r.status_code >= 400:
         _raise_graph_error(r)
     return r.json()
+
+
+async def _graph_post_no_response(path: str, body: dict | None = None) -> None:
+    request_options: dict = {
+        "headers": {**_auth_headers(), "Content-Type": "application/json"},
+    }
+    if body is not None:
+        request_options["json"] = body
+    r = await _http.post(path, **request_options)
+    if r.status_code >= 400:
+        _raise_graph_error(r)
 
 
 def _raise_graph_error(r: httpx.Response):
@@ -474,6 +487,52 @@ async def delete_folder(folder_id: str, force: bool = False) -> str:
     return json.dumps({"status": "deleted", "id": folder_id})
 
 
+def _local_file_attachments(attachment_paths: list[str] | None) -> list[dict]:
+    if not attachment_paths:
+        return []
+
+    attachments: list[dict] = []
+    for raw_path in attachment_paths:
+        path = Path(raw_path).expanduser()
+        try:
+            stat_result = path.stat()
+        except OSError as exc:
+            raise ValueError(f"Invalid attachment path {raw_path!r}: {exc.strerror}") from exc
+
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ValueError(f"Invalid attachment path {raw_path!r}: not a regular file")
+        if stat_result.st_size > DEFAULT_ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"Invalid attachment path {raw_path!r}: file is {stat_result.st_size} bytes, "
+                f"exceeding the {DEFAULT_ATTACHMENT_MAX_BYTES} byte limit"
+            )
+
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"Invalid attachment path {raw_path!r}: {exc.strerror}") from exc
+
+        attachments.append(
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": path.name,
+                "contentType": mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream",
+                "contentBytes": base64.b64encode(content).decode("ascii"),
+            }
+        )
+    return attachments
+
+
+async def _add_attachments_to_message(message_id: str, attachments: list[dict]) -> None:
+    encoded_message_id = _graph_path_segment(message_id)
+    for attachment in attachments:
+        await _graph_post(
+            f"/messages/{encoded_message_id}/attachments",
+            attachment,
+        )
+
+
 @mcp.tool()
 async def send_email(
     to: list[str],
@@ -481,6 +540,7 @@ async def send_email(
     body: str,
     cc: list[str] | None = None,
     body_type: str = "Text",
+    attachments: list[str] | None = None,
 ) -> str:
     """Send an email.
 
@@ -490,7 +550,10 @@ async def send_email(
         body: Email body content.
         cc: Optional list of CC email addresses.
         body_type: "Text" for plain text or "HTML" for rich content.
+        attachments: Optional local file paths to attach. Files are validated and
+            encoded as Graph fileAttachment values before sending.
     """
+    file_attachments = _local_file_attachments(attachments)
     message: dict = {
         "subject": subject,
         "body": {"contentType": body_type, "content": body},
@@ -498,14 +561,10 @@ async def send_email(
     }
     if cc:
         message["ccRecipients"] = [{"emailAddress": {"address": a}} for a in cc]
+    if file_attachments:
+        message["attachments"] = file_attachments
 
-    r = await _http.post(
-        "/sendMail",
-        headers={**_auth_headers(), "Content-Type": "application/json"},
-        json={"message": message},
-    )
-    if r.status_code >= 400:
-        _raise_graph_error(r)
+    await _graph_post_no_response("/sendMail", {"message": message})
     return json.dumps({"status": "sent", "to": to, "subject": subject})
 
 
@@ -567,6 +626,7 @@ async def reply_email(
     body: str,
     reply_all: bool = False,
     body_type: str = "Text",
+    attachments: list[str] | None = None,
 ) -> str:
     """Reply to an email thread.
 
@@ -575,15 +635,27 @@ async def reply_email(
         body: Reply body content.
         reply_all: True to reply to all recipients, False for sender only.
         body_type: "Text" or "HTML".
+        attachments: Optional local file paths to attach. Files are validated and
+            encoded as Graph fileAttachment values before sending.
     """
-    action = "replyAll" if reply_all else "reply"
-    r = await _http.post(
-        f"/messages/{message_id}/{action}",
-        headers={**_auth_headers(), "Content-Type": "application/json"},
-        json={"comment": body},
+    file_attachments = _local_file_attachments(attachments)
+    if not file_attachments:
+        action = "replyAll" if reply_all else "reply"
+        await _graph_post_no_response(
+            f"/messages/{message_id}/{action}",
+            {"comment": body},
+        )
+        return json.dumps({"status": "replied", "id": message_id, "replyAll": reply_all})
+
+    encoded_message_id = _graph_path_segment(message_id)
+    draft_action = "createReplyAll" if reply_all else "createReply"
+    draft = await _graph_post(
+        f"/messages/{encoded_message_id}/{draft_action}",
+        {"message": {"body": {"contentType": body_type, "content": body}}},
     )
-    if r.status_code >= 400:
-        _raise_graph_error(r)
+    draft_id = draft["id"]
+    await _add_attachments_to_message(draft_id, file_attachments)
+    await _graph_post_no_response(f"/messages/{_graph_path_segment(draft_id)}/send")
     return json.dumps({"status": "replied", "id": message_id, "replyAll": reply_all})
 
 
@@ -593,6 +665,7 @@ async def forward_email(
     to: list[str],
     body: str | None = None,
     body_type: str = "Text",
+    attachments: list[str] | None = None,
 ) -> str:
     """Forward an email to new recipients.
 
@@ -601,19 +674,35 @@ async def forward_email(
         to: List of recipient email addresses.
         body: Optional comment to include above the forwarded message.
         body_type: "Text" or "HTML".
+        attachments: Optional local file paths to attach. Files are validated and
+            encoded as Graph fileAttachment values before sending.
     """
+    file_attachments = _local_file_attachments(attachments)
     payload: dict = {
         "toRecipients": [{"emailAddress": {"address": a}} for a in to],
     }
     if body:
         payload["comment"] = body
-    r = await _http.post(
-        f"/messages/{message_id}/forward",
-        headers={**_auth_headers(), "Content-Type": "application/json"},
-        json=payload,
+    if not file_attachments:
+        await _graph_post_no_response(
+            f"/messages/{message_id}/forward",
+            payload,
+        )
+        return json.dumps({"status": "forwarded", "id": message_id, "to": to})
+
+    encoded_message_id = _graph_path_segment(message_id)
+    message: dict = {
+        "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+    }
+    if body is not None:
+        message["body"] = {"contentType": body_type, "content": body}
+    draft = await _graph_post(
+        f"/messages/{encoded_message_id}/createForward",
+        {"message": message},
     )
-    if r.status_code >= 400:
-        _raise_graph_error(r)
+    draft_id = draft["id"]
+    await _add_attachments_to_message(draft_id, file_attachments)
+    await _graph_post_no_response(f"/messages/{_graph_path_segment(draft_id)}/send")
     return json.dumps({"status": "forwarded", "id": message_id, "to": to})
 
 

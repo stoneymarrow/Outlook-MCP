@@ -141,7 +141,8 @@ send_email(
     to=["john@example.com"],
     subject="Meeting follow-up",
     body="Thanks for the discussion today.",
-    cc=["boss@example.com"]
+    cc=["boss@example.com"],
+    attachments=["/path/to/agenda.pdf"]
 )
 ```
 
@@ -151,6 +152,11 @@ Reply to an existing email thread.
 ```
 reply_email(message_id="AAMkAG...", body="Noted, thanks.")
 reply_email(message_id="AAMkAG...", body="Sharing with the team.", reply_all=True)
+reply_email(
+    message_id="AAMkAG...",
+    body="Attaching the backup.",
+    attachments=["/path/to/backup.xlsx"]
+)
 ```
 
 #### `forward_email`
@@ -160,9 +166,12 @@ Forward an email to new recipients.
 forward_email(
     message_id="AAMkAG...",
     to=["colleague@example.com"],
-    body="FYI - see below."
+    body="FYI - see below.",
+    attachments=["/path/to/context.pdf"]
 )
 ```
+
+For `send_email`, `reply_email`, and `forward_email`, `attachments` is an optional list of local file paths. The server validates each path before any Graph write request, enforces the same 100 MiB per-file limit used by attachment downloads, and sends each file as a Microsoft Graph `fileAttachment` with filename, detected content type, and base64 content.
 
 #### `move_email`
 Move an email to a different folder.
