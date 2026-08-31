@@ -14,7 +14,7 @@ MCP server for Microsoft 365 email + calendar + contacts. Uses Graph API with cl
 
 ## Azure AD App
 - Application registration in your tenant
-- Declared permissions: `Mail.Read`, `Calendars.Read`, `Contacts.Read` (application, admin-consented); see the regression-tested constants in `main.py`
+- Recommended intake permissions are `Mail.Read`, `Calendars.Read`, and `Contacts.Read`; the optional write-enabled email profile and `.default` behavior are documented in `README.md`. The regression-tested constants in `main.py` guard the recommendation, not permissions additionally granted in Azure.
 - Client secret rotation: track expiry in your Azure portal
 
 ## Tools (21)

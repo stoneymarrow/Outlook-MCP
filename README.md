@@ -15,9 +15,11 @@ This server uses application permissions via MSAL.
 
 Go to **Azure Portal > App Registrations > New Registration**.
 
-### 2. Add application permissions
+### 2. Choose an application-permission profile
 
-Under **API Permissions > Add a permission > Microsoft Graph > Application permissions**, add:
+Under **API Permissions > Add a permission > Microsoft Graph > Application permissions**, choose one profile.
+
+#### Recommended: read-only intake
 
 | Permission | Purpose |
 |-----------|---------|
@@ -25,14 +27,41 @@ Under **API Permissions > Add a permission > Microsoft Graph > Application permi
 | `Calendars.Read` | List calendar events |
 | `Contacts.Read` | List and search contacts |
 
+Use this profile for intake deployments.
+Graph rejects any tool operation that needs a permission outside this set.
+Do not add write-capable application permissions to an intake deployment; use a separate app registration and deployment when writes are intentional.
+
+#### Optional: write-enabled email
+
+To use all paths in `send_email`, `reply_email`, and `forward_email`, replace `Mail.Read` with `Mail.ReadWrite` and add `Mail.Send`.
+Keep `Calendars.Read` and `Contacts.Read` if the deployment also uses the read tools.
+This profile covers the email operations below, not unrelated calendar mutations.
+
+Microsoft's current permission tables list these least-privileged **application** permissions:
+
+| Operation used by this server | Least application permission |
+|-----------|---------|
+| New message ([`sendMail`](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0)) | `Mail.Send` |
+| Direct reply or reply-all ([`reply`](https://learn.microsoft.com/en-us/graph/api/message-reply?view=graph-rest-1.0), [`replyAll`](https://learn.microsoft.com/en-us/graph/api/message-replyall?view=graph-rest-1.0)) | `Mail.Send` |
+| Direct forward ([`forward`](https://learn.microsoft.com/en-us/graph/api/message-forward?view=graph-rest-1.0)) | `Mail.Send` |
+| Create a reply or reply-all draft ([`createReply`](https://learn.microsoft.com/en-us/graph/api/message-createreply?view=graph-rest-1.0), [`createReplyAll`](https://learn.microsoft.com/en-us/graph/api/message-createreplyall?view=graph-rest-1.0)) | `Mail.ReadWrite` |
+| Create a forward draft ([`createForward`](https://learn.microsoft.com/en-us/graph/api/message-createforward?view=graph-rest-1.0)) | `Mail.ReadWrite` |
+| [Add a file attachment](https://learn.microsoft.com/en-us/graph/api/message-post-attachments?view=graph-rest-1.0) to a draft | `Mail.ReadWrite` |
+| [Send an existing draft](https://learn.microsoft.com/en-us/graph/api/message-send?view=graph-rest-1.0) | `Mail.Send` |
+
+Without local attachments, replies and forwards use the direct actions and need `Mail.Send`.
+With local attachments, they create a draft, add files, and send the draft, so the complete flow needs both `Mail.ReadWrite` and `Mail.Send`.
+`Mail.ReadWrite` does not include permission to send mail.
+
 ### 3. Grant admin consent
 
 Click **Grant admin consent for [your tenant]**.
-All three permissions must show a green checkmark.
+Every permission in the selected profile must show a green checkmark.
 
-The permission set above is intentionally read-only and is enforced by a regression test against the constants in `main.py`.
-Mutation tools retained for existing installations will be rejected by Graph under this profile.
-Do not add a write-capable application permission to an intake deployment.
+At runtime, client-credential authentication requests `https://graph.microsoft.com/.default`.
+Azure app registration and admin consent therefore determine the application permissions in the token.
+The read-only constants in `main.py` and their regression tests document and guard the recommended repository profile; they do not request individual OAuth scopes, remove permissions already granted in Azure, or force a write-enabled registration to be read-only.
+A deployment whose Azure registration includes and has admin consent for the write permissions above can therefore execute the corresponding retained mutation tools.
 
 ### 4. Create a client secret
 
@@ -171,7 +200,9 @@ forward_email(
 )
 ```
 
-For `send_email`, `reply_email`, and `forward_email`, `attachments` is an optional list of local file paths. The server validates each path before any Graph write request, enforces the same 100 MiB per-file limit used by attachment downloads, and sends each file as a Microsoft Graph `fileAttachment` with filename, detected content type, and base64 content.
+For `send_email`, `reply_email`, and `forward_email`, `attachments` is an optional list of local file paths. The server validates each path before any Graph write request, enforces the same 100 MiB per-file local guard used by attachment downloads, and sends each file as a Microsoft Graph `fileAttachment` with filename, detected content type, and base64 content. That local guard is not a promise that Graph accepts files of that size; in particular, Microsoft documents the draft [file-attachment operation](https://learn.microsoft.com/en-us/graph/api/message-post-attachments?view=graph-rest-1.0) used by attached replies and forwards as limited to attachments under 3 MB.
+
+A routed live check on 2026-08-31 verified the new-message path in a write-enabled deployment: Graph returned `202 Accepted` for a self-addressed message with a small local text attachment, and inbox readback found the same subject with `hasAttachments=true`. This demonstrates the permission-dependent capability without changing the recommended read-only intake profile. Replies, forwards, and multiple-file request sequences are covered by the repository's mocked test suite rather than that live check.
 
 #### `move_email`
 Move an email to a different folder.
