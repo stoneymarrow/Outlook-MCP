@@ -159,7 +159,7 @@ def _raise_graph_error(r: httpx.Response):
 _MSG_LIST_FIELDS = (
     "id,internetMessageId,subject,from,receivedDateTime,isRead,hasAttachments"
 )
-_MSG_FULL_FIELDS = f"{_MSG_LIST_FIELDS},body,toRecipients,ccRecipients"
+_MSG_FULL_FIELDS = f"{_MSG_LIST_FIELDS},body,toRecipients,ccRecipients,conversationId"
 
 
 def _fmt_message(m: dict, full: bool = False) -> dict:
@@ -180,6 +180,7 @@ def _fmt_message(m: dict, full: bool = False) -> dict:
         out["body"] = body.get("content", "")
         out["to"] = [r["emailAddress"]["address"] for r in m.get("toRecipients", [])]
         out["cc"] = [r["emailAddress"]["address"] for r in m.get("ccRecipients", [])]
+        out["conversationId"] = m.get("conversationId", "")
     return out
 
 
